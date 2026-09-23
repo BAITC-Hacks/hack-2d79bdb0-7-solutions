@@ -1,6 +1,7 @@
 """Read partner ZIPs in memory. Never extract paths or execute spreadsheet content."""
 import io
 import json
+import math
 import re
 import zipfile
 from collections import Counter, defaultdict
@@ -11,6 +12,43 @@ from openpyxl import load_workbook
 from engine import detect_outliers, num
 
 MONTHS = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек']
+
+
+def reconcile_months(items, movements, as_of='2026-09-23', skipped_rows=0):
+    """Diagnostic quantities only; no document, customer or warehouse identifiers.
+
+    movements maps (code, month) to signed quantity buckets. Absence of a
+    movement is unknown, not proof of zero sales or complete source coverage.
+    """
+    monthly = {(it['code'], month): value for it in items.values()
+               for month, value in it['sales'].items()}
+    rows = []
+    for code, month in sorted(monthly.keys() | movements.keys()):
+        totals = movements.get((code, month))
+        sales = monthly.get((code, month))
+        net = sum(totals[k] for k in ('invoice_positive', 'invoice_negative',
+                                     'other_positive', 'other_negative')) if totals else None
+        delta = net - sales if net is not None and sales is not None else None
+        if sales is None:
+            status, reason = 'missing_monthly', 'Нет месячных продаж для кода и месяца'
+        elif totals is None:
+            status, reason = 'missing_dynamics', 'Нет строк динамики; нулевые продажи не подтверждены'
+        elif math.isclose(delta, 0, rel_tol=0, abs_tol=1e-6):
+            status, reason = 'matched', 'Суммы совпали; состав документов и периметр требуют проверки'
+        else:
+            status, reason = 'difference', 'Сумма динамики со знаками отличается от месячных продаж'
+        rows.append(dict(code=code, sku=items.get(code, {}).get('sku'), month=month,
+                         monthly_sales=sales, dynamics_net=net, delta=delta,
+                         status=status, reason=reason, partial_month=month >= as_of[:7],
+                         **(totals or {})))
+    return dict(rows=rows, status_counts=dict(Counter(r['status'] for r in rows)),
+                skipped_rows=skipped_rows, tolerance=1e-6, notes=[
+                    'delta = сумма всех распознанных количеств динамики со знаками − месячные продажи.',
+                    'Прочие документы показаны отдельно; их включение в нетто-продажи не подтверждено.',
+                    'Совпадение сумм не доказывает полноту периода, одинаковые склады или единицы.',
+                    'Месяц даты расчёта и будущие месяцы помечены partial_month; даты выгрузок могут различаться.',
+                    'Отчёт не изменяет прогноз, выбросы или утверждение заказа.'
+                ])
 
 
 def month_key(value):
@@ -26,6 +64,8 @@ def import_zip(payload, filename=''):
     items = {}
     sources = []
     transactions = defaultdict(list)
+    movements = {}
+    skipped_rows = 0
     types = Counter()
     seasonality = [1.0]*12
     with zipfile.ZipFile(io.BytesIO(payload), metadata_encoding='cp866') as archive:
@@ -56,14 +96,27 @@ def import_zip(payload, filename=''):
             rows = ws.iter_rows(values_only=True)
             if 'динамика' in low:
                 for row in rows:
+                    if len(row) < 8:
+                        skipped_rows += 1
+                        continue
                     if not row[3] or row[3]=='Код':
                         continue
                     try:
-                        dt = datetime.strptime(str(row[0]), '%d.%m.%Y %H:%M:%S')
-                    except ValueError:
+                        dt = row[0] if isinstance(row[0], datetime) else datetime.strptime(str(row[0]), '%d.%m.%Y %H:%M:%S')
+                        quantity = num(row[7], float('nan'))
+                        if not math.isfinite(quantity):
+                            raise ValueError('Missing or invalid quantity')
+                    except (ValueError, TypeError):
+                        skipped_rows += 1
                         continue
                     doc = str(row[2] or '')
                     types[doc.split(' ')[0]] += 1
+                    key = (str(row[3]).strip(), dt.strftime('%Y-%m'))
+                    totals = movements.setdefault(key, dict(invoice_positive=0, invoice_negative=0,
+                        other_positive=0, other_negative=0, row_count=0))
+                    bucket = 'invoice' if doc.startswith('Расходная накладная') else 'other'
+                    totals[bucket + ('_negative' if quantity < 0 else '_positive')] += quantity
+                    totals['row_count'] += 1
                     # Partner export: ordinary invoices are positive; negative corrections
                     # are already netted in monthly totals and are not demand spikes.
                     if doc.startswith('Расходная накладная') and num(row[7])>0:
@@ -160,6 +213,7 @@ def import_zip(payload, filename=''):
                 it['warnings'].append('Кратность взята из MOQ; в месячной таблице другое значение')
             it['warnings'].append('В исходной динамике нет ID клиента; выбросы определены по накладным')
         return dict(items=list(items.values()),meta=dict(supplier=supplier,as_of='2026-09-23',
+            reconciliation={supplier: reconcile_months(items, movements, skipped_rows=skipped_rows)},
             source_date='2026-09-22',sources=sources,transactions=sum(map(len,transactions.values())),
             document_types=dict(types), notes=[
                 'Пустые месячные продажи трактуются как нулевые продажи в форме 1С; пустые остатки остаются неизвестными.',
@@ -172,11 +226,17 @@ def import_zip(payload, filename=''):
 def merge_datasets(datasets):
     items={i['id']:i for d in datasets for i in d['items']}
     counts={}
+    reconciliation={}
     for d in datasets:
+        # A supplier refresh replaces its complete report, including orphan codes.
+        if d['meta'].get('supplier'):
+            reconciliation.pop(d['meta']['supplier'], None)
+        reconciliation.update(d['meta'].get('reconciliation', {}))
         counts.update(d['meta'].get('transaction_counts',{}))
         if d['meta'].get('supplier'):
             counts[d['meta']['supplier']]=d['meta'].get('transactions',0)
     return dict(items=list(items.values()),meta=dict(as_of='2026-09-23',
+        reconciliation=reconciliation,
         sources=[s for d in datasets for s in d['meta'].get('sources',[])],
         transaction_counts=counts,transactions=sum(counts.values()),
         notes=list(dict.fromkeys(n for d in datasets for n in d['meta'].get('notes',[])))))
@@ -225,8 +285,15 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser()
     parser.add_argument('archives',nargs='+')
     parser.add_argument('--output',default='data/dataset.json')
+    parser.add_argument('--reconciliation-output', help='Локальный JSON сверки по поставщику/коду/месяцу')
     args=parser.parse_args()
+    if args.reconciliation_output and Path(args.reconciliation_output).resolve()==Path(args.output).resolve():
+        parser.error('Файлы набора и отчёта должны различаться')
     ds=merge_datasets([import_zip(Path(p).read_bytes(),Path(p).name) for p in args.archives])
     out=Path(args.output); out.parent.mkdir(exist_ok=True,parents=True)
     out.write_text(json.dumps(ds,ensure_ascii=False),encoding='utf-8')
+    if args.reconciliation_output:
+        report=Path(args.reconciliation_output)
+        report.parent.mkdir(exist_ok=True,parents=True)
+        report.write_text(json.dumps(ds['meta']['reconciliation'],ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps(dict(items=len(ds['items']),transactions=ds['meta']['transactions'],sources=len(ds['meta']['sources'])),ensure_ascii=False))
