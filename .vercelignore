@@ -1,0 +1,15 @@
+# Only reviewed application source goes to Vercel, never local runtime data.
+data/
+.venv/
+.git/
+.env
+.env.*
+**/__pycache__/
+**/*.pyc
+**/*.sqlite3*
+**/*.db
+**/*.secret
+**/*.xlsx
+**/*.xls
+**/*.zip
+tests/

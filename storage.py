@@ -31,15 +31,25 @@ class PostgresConnection:
         return self.connection.execute(query.replace('?', '%s'), params)
 
 
+def postgres_schema():
+    schema=os.environ.get('PGSCHEMA','public')
+    if not re.fullmatch(r'[a-z_][a-z0-9_]{0,62}',schema):
+        raise ValueError('Invalid PGSCHEMA')
+    return schema
+
+
 @contextmanager
 def postgres_connect(url):
     import certifi
     import psycopg
     from psycopg.rows import dict_row
     with psycopg.connect(url, row_factory=dict_row, connect_timeout=15,
-                         sslmode='verify-full', sslrootcert=certifi.where()) as connection:
+                         prepare_threshold=None,
+                         sslmode='verify-full', sslrootcert=os.environ.get('PGSSLROOTCERT') or certifi.where()) as connection:
         # Neon pooler disallows startup options. Apply timeout inside transaction.
         connection.execute("SET LOCAL statement_timeout = '30s'")
+        schema=postgres_schema()
+        if schema!='public':connection.execute(f'SET LOCAL search_path TO "{schema}"')
         yield connection
 
 
@@ -47,6 +57,8 @@ def initialize_postgres(url):
     # Explicit startup/migration step, never DDL per HTTP request.
     schema=SCHEMA.replace('id INTEGER PRIMARY KEY', 'id SERIAL PRIMARY KEY').replace('REAL', 'DOUBLE PRECISION')
     with postgres_connect(url) as db:
+        selected=postgres_schema()
+        if selected!='public':db.execute(f'CREATE SCHEMA IF NOT EXISTS "{selected}"')
         for statement in schema.split(';'):
             if statement.strip():db.execute(statement)
 
