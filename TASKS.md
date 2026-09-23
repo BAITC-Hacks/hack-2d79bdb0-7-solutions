@@ -14,7 +14,7 @@
 
 ## Текущая работа Мадияра
 
-UI-2 / PLAN-B: `madiyar/dynamic-glass-plan-b` — Dynamic Glass / Apple typography, фильтр категории, сводка сверки DATA-1, изолированная симуляция задержки и спроса с планом срочного покрытия. Файлы: static/, scenario.py, engine.py (дневной план), server.py (новый API), tests/test_scenario.py, документация. Реализовано локально, готовится PR; 42 теста проходят. MODEL-1 остаётся свободной отдельной задачей.
+UI-2 / PLAN-B: `madiyar/dynamic-glass-plan-b` — Dynamic Glass / Apple typography, фильтр категории, сводка сверки DATA-1, изолированная симуляция задержки и спроса с планом срочного покрытия. Файлы: static/, scenario.py, engine.py (дневной план), server.py (новый API), tests/test_scenario.py, документация. PR #2 открыт: https://github.com/BAITC-Hacks/hack-2d79bdb0-7-solutions/pull/2; 42 теста проходят, ожидает ревью. MODEL-1 остаётся свободной отдельной задачей.
 
 ## Правило разделения
 
