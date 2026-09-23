@@ -43,7 +43,7 @@ def read_snapshot(source):
             "SELECT * FROM documents WHERE kind IN ('dataset','order') ORDER BY kind,id")]
     owners={u['id'] for u in users}
     for doc in documents:
-        json.loads(doc['body'])
+        storage.decode_document(doc['body'])
         if doc['kind']=='order' and doc['user_id'] not in owners:
             raise ValueError('An order has no valid owner; resolve locally before migration')
     if not any(d['kind']=='dataset' and d['id']=='workspace' for d in documents):
@@ -59,7 +59,9 @@ def read_snapshot(source):
     return users,documents
 
 
-def migrate(url,users,documents):
+def migrate(url,users,documents,compress_documents=False):
+    if compress_documents:
+        documents=[dict(doc,body=storage.encode_document(storage.decode_document(doc['body']),compress=True)) for doc in documents]
     storage.initialize_postgres(url)
     with storage.postgres_connect(url) as db:
         db.execute('LOCK TABLE users,sessions,documents,login_failures IN ACCESS EXCLUSIVE MODE')
@@ -92,6 +94,7 @@ def main():
     transfer=sub.add_parser('migrate')
     transfer.add_argument('--source',type=Path,default=Path('data/app.sqlite3'))
     transfer.add_argument('--backup-dir',type=Path,default=Path('data/backups'))
+    transfer.add_argument('--compress-documents',action='store_true',help='Losslessly compress large documents for serverless databases')
     sub.add_parser('create-user')
     args=parser.parse_args()
     url=args.url_file.read_text(encoding='utf-8-sig').strip() if args.url_file else os.environ.get('DATABASE_URL','')
@@ -101,7 +104,7 @@ def main():
     elif args.command=='migrate':
         backup=snapshot(args.source,args.backup_dir)
         users,documents=read_snapshot(backup)
-        print(json.dumps(migrate(url,users,documents)))
+        print(json.dumps(migrate(url,users,documents,compress_documents=args.compress_documents)))
         print('Verified private local backup:',backup)
     else:
         storage.initialize_postgres(url)

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "python",
+  "regions": ["fra1"],
+  "functions": {
+    "vercel_entry.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{data/**,.venv/**,tests/**,.env,.env.*,**/*.secret,**/*.sqlite3*,**/*.db,**/*.xlsx,**/*.xls,**/*.zip}"
+    }
+  }
+}

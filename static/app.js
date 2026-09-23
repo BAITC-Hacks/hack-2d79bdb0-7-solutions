@@ -4,10 +4,20 @@ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const fmt=v=>v==null?'—':Number(v).toLocaleString('ru-RU',{maximumFractionDigits:1});
 let token='', result=null, demo=false, supplier='', page=0, selection=new Map(), quantities=new Map(), stocks={}, policies={}, currentId=null, busy=false;
 const PAGE_SIZE=25;
+let uploadLimit=40_000_000;
 function notify(message,error=false){$('notice').textContent=message;$('notice').classList.toggle('error',error);$('notice').hidden=false;}
 async function api(path,payload,extra={}){
+ if(path==='/api/import'&&payload instanceof ArrayBuffer&&payload.byteLength>uploadLimit){
+  if((extra['X-Filename']||'').endsWith('.json'))payload=new TextEncoder().encode(JSON.stringify(JSON.parse(new TextDecoder().decode(payload)))).buffer;
+  if(payload.byteLength>40_000_000)throw new Error('Файл превышает 40 МБ. Загрузите архивы поставщиков по отдельности.');
+  if(typeof CompressionStream!=='undefined'){
+   payload=await new Response(new Blob([payload]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+   extra={...extra,'X-Upload-Encoding':'gzip'};
+  }
+  if(payload.byteLength>uploadLimit)throw new Error('Файл слишком большой для Vercel даже после сжатия. Используйте компактный JSON или перенос базы администратором.');
+ }
  const response=await fetch(path,{method:'POST',headers:{'X-App-Token':token,'Content-Type':'application/json',...extra},body:typeof payload==='string'||payload instanceof ArrayBuffer?payload:JSON.stringify(payload)});
- const data=await response.json();if(response.status===401&&typeof showAuth==='function')showAuth();if(!response.ok)throw new Error(data.error||'Ошибка запроса');return data;
+ const data=await response.json().catch(()=>({error:response.status===413?'Превышен лимит размера запроса Vercel':'Сервер не смог обработать запрос. Попробуйте ещё раз.'}));if(response.status===401&&typeof showAuth==='function')showAuth();if(!response.ok)throw new Error(data.error||'Ошибка запроса');return data;
 }
 function options(){return {as_of:$('asOf').value,lead_days:Number($('lead').value),review_days:Number($('review').value),safety_days:Number($('safety').value),growth_pct:Number($('growth').value),exclude_outliers:$('outliers').checked,compensate_stockout:$('stockouts').checked,stock_overrides:stocks,category_policy:policies};}
 function dirty(){if(result){result.calculation_id=null;$('calcStatus').textContent='Параметры изменены — пересчитайте';$('approve').disabled=true;selection.clear();renderTable();invalidateScenario();}}

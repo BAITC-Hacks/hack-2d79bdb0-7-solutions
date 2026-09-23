@@ -22,11 +22,11 @@ from scenario import simulate
 
 ROOT=Path(__file__).resolve().parent
 DATA=ROOT/'data'
-DATA.mkdir(exist_ok=True)
 LOCK=threading.RLock()
 TOKEN=secrets.token_urlsafe(24)
 STATE={}
 CLOUD=os.environ.get('APP_ENV')=='cloud'
+if not CLOUD:DATA.mkdir(exist_ok=True)
 APP_ORIGIN=os.environ.get('APP_ORIGIN','').rstrip('/')
 if CLOUD and not APP_ORIGIN and os.environ.get('RENDER_EXTERNAL_HOSTNAME'):
     APP_ORIGIN='https://'+os.environ['RENDER_EXTERNAL_HOSTNAME']
@@ -111,7 +111,8 @@ class Handler(BaseHTTPRequestHandler):
                 with storage.database(DATA/'app.sqlite3') as db:db.execute('SELECT 1')
                 return self.send({'ok':True})
             if path=='/api/config':
-                return self.send(dict(registration_enabled=not CLOUD,hosted=CLOUD))
+                return self.send(dict(registration_enabled=not CLOUD,hosted=CLOUD,
+                    max_upload_bytes=3_000_000 if os.environ.get('VERCEL') else 40_000_000))
             user=self.current_user() if path.startswith('/api/') else None
             if path.startswith('/api/') and not user:
                 return self.send({'error':'Войдите в аккаунт'},401)

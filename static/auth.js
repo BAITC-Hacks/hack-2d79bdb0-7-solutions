@@ -41,6 +41,7 @@ $('refreshOrders').onclick=loadOrders;
 (async()=>{try{
  const configResponse=await fetch('/api/config');if(!configResponse.ok)throw new Error('Не удалось загрузить настройки входа');
  const config=await configResponse.json();registrationEnabled=config.registration_enabled===true;
+ uploadLimit=Number(config.max_upload_bytes)||40_000_000;
  $('registerTab').hidden=!registrationEnabled;
  document.querySelector('.auth-local').textContent=config.hosted?'Закрытое пространство команды 7-Solutions. Доступ выдаёт администратор команды.':'Локальное пространство команды 7-Solutions. Аккаунт создаётся на этом компьютере. Email не проверяется письмом.';
  const response=await fetch('/api/auth/me');if(response.status===401){showAuth();return;}const data=await response.json();if(!response.ok)throw new Error(data.error);await enterWorkspace(data.user,data.token);

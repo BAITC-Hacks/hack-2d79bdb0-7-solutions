@@ -9,3 +9,6 @@ data/*
 *.sqlite3*
 *.db
 *.secret
+.vercel/
+.vercel
+.env*

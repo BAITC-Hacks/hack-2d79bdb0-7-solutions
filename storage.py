@@ -1,5 +1,7 @@
 """One private team workspace: SQLite locally, PostgreSQL on hosted deployments."""
 import hashlib
+import base64
+import gzip
 import hmac
 import json
 import os
@@ -31,15 +33,28 @@ class PostgresConnection:
         return self.connection.execute(query.replace('?', '%s'), params)
 
 
+def postgres_schema():
+    schema=os.environ.get('PGSCHEMA','public')
+    if not re.fullmatch(r'[a-z_][a-z0-9_]{0,62}',schema):
+        raise ValueError('Invalid PGSCHEMA')
+    return schema
+
+
 @contextmanager
 def postgres_connect(url):
     import certifi
     import psycopg
     from psycopg.rows import dict_row
     with psycopg.connect(url, row_factory=dict_row, connect_timeout=15,
-                         sslmode='verify-full', sslrootcert=certifi.where()) as connection:
+                         prepare_threshold=None,
+                         sslmode='verify-full', sslrootcert=os.environ.get('PGSSLROOTCERT') or certifi.where()) as connection:
         # Neon pooler disallows startup options. Apply timeout inside transaction.
         connection.execute("SET LOCAL statement_timeout = '30s'")
+        # Some hosted defaults round float text output, breaking exact migration
+        # verification of timestamps. Request round-trip double precision.
+        connection.execute('SET LOCAL extra_float_digits = 3')
+        schema=postgres_schema()
+        if schema!='public':connection.execute(f'SET LOCAL search_path TO "{schema}"')
         yield connection
 
 
@@ -47,6 +62,8 @@ def initialize_postgres(url):
     # Explicit startup/migration step, never DDL per HTTP request.
     schema=SCHEMA.replace('id INTEGER PRIMARY KEY', 'id SERIAL PRIMARY KEY').replace('REAL', 'DOUBLE PRECISION')
     with postgres_connect(url) as db:
+        selected=postgres_schema()
+        if selected!='public':db.execute(f'CREATE SCHEMA IF NOT EXISTS "{selected}"')
         for statement in schema.split(';'):
             if statement.strip():db.execute(statement)
 
@@ -140,11 +157,25 @@ def logout(path,token):
         db.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(token.encode()).hexdigest(),))
 
 
+def encode_document(body,compress=False):
+    text=json.dumps(body,ensure_ascii=False,allow_nan=False,separators=(',',':'))
+    if compress and len(text)>64_000:
+        packed='gz1:'+base64.b64encode(gzip.compress(text.encode('utf-8'),compresslevel=6,mtime=0)).decode('ascii')
+        if len(packed)<len(text):return packed
+    return text
+
+
+def decode_document(text):
+    if text.startswith('gz1:'):
+        text=gzip.decompress(base64.b64decode(text[4:],validate=True)).decode('utf-8')
+    return json.loads(text)
+
+
 def put(path,kind,key,body,user_id=None):
     with database(path) as db:
         db.execute('''INSERT INTO documents VALUES(?,?,?,?,?) ON CONFLICT(kind,id)
                    DO UPDATE SET user_id=excluded.user_id,body=excluded.body,created=excluded.created''',
-                   (kind,key,user_id,json.dumps(body,ensure_ascii=False,allow_nan=False),time.time()))
+                   (kind,key,user_id,encode_document(body,compress=bool(os.environ.get('DATABASE_URL'))),time.time()))
         if kind=='calculation':
             db.execute("DELETE FROM documents WHERE kind='calculation' AND user_id=? AND id NOT IN (SELECT id FROM documents WHERE kind='calculation' AND user_id=? ORDER BY created DESC LIMIT 15)",(user_id,user_id))
 
@@ -153,7 +184,7 @@ def get(path,kind,key,user_id=None):
     with database(path) as db:
         row=db.execute('SELECT body,user_id FROM documents WHERE kind=? AND id=?',(kind,key)).fetchone()
     if not row or (user_id is not None and row['user_id']!=user_id):return None
-    return json.loads(row['body'])
+    return decode_document(row['body'])
 
 
 def clear_calculations(path):
@@ -165,4 +196,4 @@ def orders(path,user_id):
         rows=db.execute("SELECT body FROM documents WHERE kind='order' AND user_id=? ORDER BY created DESC LIMIT 100",(user_id,)).fetchall()
     return [dict(id=o['id'],created=o['created'],mode=o['mode'],responsible=o['responsible'],
                  lines=len(o['rows']),suppliers=sorted({r['supplier'] for r in o['rows']}))
-            for row in rows for o in [json.loads(row['body'])]]
+            for row in rows for o in [decode_document(row['body'])]]
