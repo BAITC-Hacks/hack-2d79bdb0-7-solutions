@@ -1,4 +1,4 @@
-"""Local-only HTTP application. No supplier messages or external AI calls."""
+"""Local recommendations with optional OpenAI explanations. No supplier messages."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -15,6 +15,7 @@ import zipfile
 from engine import calculate, num
 from importer import import_zip, merge_datasets, validate_normalized
 from demo import dataset as demo_dataset
+import ai_explanations
 
 ROOT=Path(__file__).resolve().parent
 DATA=ROOT/'data'
@@ -22,6 +23,23 @@ DATA.mkdir(exist_ok=True)
 LOCK=threading.RLock()
 TOKEN=secrets.token_urlsafe(24)
 STATE={}
+AI_LOCK=threading.Lock()
+
+
+def recommendation_reason(row):
+    return (row.get('ai_explanation', '') + ' ' + row['explanation'].split(' Остаток неизвестен:')[0]).strip()
+
+
+def selected_recommendations(state, payload, maximum=10000):
+    ids=payload.get('ids')
+    if not isinstance(ids,list) or not 0<len(ids)<=maximum or any(not isinstance(i,str) for i in ids):
+        raise ValueError('Выберите позиции рекомендаций')
+    if len(set(ids))!=len(ids):
+        raise ValueError('Позиции не должны повторяться')
+    rows={r['id']:r for r in state['result']['rows'] if r['quantity']>0}
+    if any(i not in rows for i in ids):
+        raise ValueError('Неизвестная рекомендация')
+    return [rows[i] for i in ids]
 
 
 def read_dataset():
@@ -75,7 +93,7 @@ class Handler(BaseHTTPRequestHandler):
             if path=='/api/status':
                 with LOCK:
                     ds=read_dataset()
-                return self.send(dict(token=TOKEN,items=len(ds['items']),meta=ds['meta']))
+                return self.send(dict(token=TOKEN,items=len(ds['items']),meta=ds['meta'],ai_configured=bool(ai_explanations.config()[0])))
             if path=='/api/template':
                 example=demo_dataset()
                 return self.send(example,headers={'Content-Disposition':'attachment; filename="normalized-example.json"'})
@@ -127,8 +145,40 @@ class Handler(BaseHTTPRequestHandler):
                     STATE.clear()
                 return self.send(dict(items=len(merged['items']),meta=merged['meta']))
             payload=json.loads(body)
+            if not isinstance(payload,dict):
+                raise ValueError('Ожидается объект JSON')
+            if path in ('/api/explain','/api/recommendations/export'):
+                with LOCK:
+                    state=STATE.get(payload.get('calculation_id'))
+                    if not state: return self.send({'error':'Пересчитайте рекомендации'},409)
+                    chosen=selected_recommendations(state,payload,25 if path=='/api/explain' else 10000)
+                    if path=='/api/recommendations/export':
+                        out=io.StringIO(newline=''); writer=csv.writer(out,delimiter=';')
+                        writer.writerow(['Артикул','Поставщик','Рекомендуемое количество','Ед.','Обоснование','Срочность','Набор','Статус'])
+                        def safe(value):
+                            text=str(value or '')
+                            return "'"+text if text.lstrip().startswith(('=','+','-','@')) else text
+                        for row in sorted(chosen,key=lambda r:(r['supplier'],r['sku'] or r['code'])):
+                            writer.writerow([safe(row.get('sku') or row['code']),safe(row['supplier']),row['quantity'],
+                                safe(row['unit']),safe(recommendation_reason(row)),
+                                'Срочно' if row['shortage_day'] is not None else 'Планово',state['mode'],'Рекомендация'])
+                        return self.send(out.getvalue().encode('utf-8-sig'),ctype='text/csv; charset=utf-8')
+                    pending=[dict(r) for r in chosen if not r.get('ai_explanation')]
+                if not AI_LOCK.acquire(blocking=False):
+                    return self.send({'error':'Обоснования уже формируются. Повторите позже.'},429)
+                try:
+                    explanations,status=ai_explanations.explain(pending)
+                finally:
+                    AI_LOCK.release()
+                with LOCK:
+                    if STATE.get(payload.get('calculation_id')) is not state:
+                        return self.send({'error':'Пересчитайте рекомендации'},409)
+                    for row in chosen:
+                        if row['id'] in explanations: row['ai_explanation']=explanations[row['id']]
+                    return self.send(dict(status=status,explanations={r['id']:r.get('ai_explanation','') for r in chosen}))
             if path=='/api/calculate':
                 options=validate_options(payload.get('options',{}))
+                options['exclude_outliers']=True
                 mode='demo' if payload.get('demo') else 'real'
                 with LOCK:
                     ds=demo_dataset() if mode=='demo' else read_dataset()

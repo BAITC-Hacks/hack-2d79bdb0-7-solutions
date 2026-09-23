@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -76,6 +77,41 @@ class WorkflowTests(unittest.TestCase):
     def test_invalid_options_are_rejected(self):
         status,_=self.post('/api/calculate',{'demo':True,'options':{'lead_days':-1}})
         self.assertEqual(status,400)
+
+    def test_outliers_always_enabled_in_dashboard_api(self):
+        _,cal=self.post('/api/calculate',{'demo':True,'options':{'exclude_outliers':False}})
+        self.assertTrue(cal['options']['exclude_outliers'])
+        self.assertEqual(next(r for r in cal['rows'] if r['code']=='DEMO-001')['quantity'],250)
+
+    def test_recommendation_export_uses_server_values_and_does_not_approve(self):
+        _,cal=self.post('/api/calculate',{'demo':True})
+        row=next(r for r in cal['rows'] if r['quantity']>0)
+        before=set(server.DATA.glob('order-*.json'))
+        req=Request(self.url+'/api/recommendations/export',data=json.dumps({
+            'calculation_id':cal['calculation_id'],'ids':[row['id']],'quantity':999999}).encode(),
+            headers={'X-App-Token':server.TOKEN})
+        with urlopen(req) as response:
+            rows=list(csv.reader(io.StringIO(response.read().decode('utf-8-sig')),delimiter=';'))
+        self.assertEqual(len(rows),2)
+        self.assertEqual(float(rows[1][2]),row['quantity'])
+        self.assertEqual(rows[1][-1],'Рекомендация')
+        self.assertEqual(set(server.DATA.glob('order-*.json')),before)
+        status,_=self.post('/api/recommendations/export',{'calculation_id':cal['calculation_id'],'ids':['unknown']})
+        self.assertEqual(status,400)
+
+    def test_ai_cached_and_does_not_change_quantity(self):
+        _,cal=self.post('/api/calculate',{'demo':True})
+        row=next(r for r in cal['rows'] if r['quantity']>0)
+        payload={'calculation_id':cal['calculation_id'],'ids':[row['id']]}
+        with patch.object(server.ai_explanations,'explain',return_value=({row['id']:'Пополнение поддержит спрос.'},'ready')):
+            status,answer=self.post('/api/explain',payload)
+        self.assertEqual(status,200)
+        self.assertIn(row['id'],answer['explanations'])
+        saved=next(r for r in server.STATE[cal['calculation_id']]['result']['rows'] if r['id']==row['id'])
+        self.assertEqual(saved['quantity'],row['quantity'])
+        with patch.object(server.ai_explanations,'explain',return_value=({},'ready')) as call:
+            self.post('/api/explain',payload)
+            self.assertEqual(call.call_args.args[0],[])
 
     def test_zip_reconciliation_survives_supplier_refresh(self):
         for supplier, quantity in [('IEK', 8), ('Systeme Electric', 15), ('IEK', 10)]:
