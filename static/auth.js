@@ -1,5 +1,5 @@
 'use strict';
-let authMode='login', activeUser=null;
+let authMode='login', activeUser=null, registrationEnabled=false;
 function showAuth(){
  activeUser=null;token='';result=null;selection.clear();quantities.clear();stocks={};policies={};scenarioVersion++;
  document.querySelectorAll('dialog[open]').forEach(d=>d.close());
@@ -10,6 +10,7 @@ function showAuth(){
  $('authSubmit').disabled=false;
 }
 function setAuthMode(mode){
+ if(mode==='register'&&!registrationEnabled)return;
  authMode=mode;const register=mode==='register';$('nameLabel').hidden=!register;$('authName').required=register;
  $('authPassword').autocomplete=register?'new-password':'current-password';
  $('authTitle').textContent=register?'Начнём с знакомства.':'С возвращением.';
@@ -37,4 +38,10 @@ $('authForm').onsubmit=async e=>{
 };
 $('logout').onclick=async()=>{try{await api('/api/auth/logout',{});showAuth();setAuthMode('login');}catch(e){notify(e.message,true);}};
 $('refreshOrders').onclick=loadOrders;
-(async()=>{try{const response=await fetch('/api/auth/me');if(response.status===401){showAuth();return;}const data=await response.json();if(!response.ok)throw new Error(data.error);await enterWorkspace(data.user,data.token);}catch(e){showAuth();$('authError').textContent='Не удалось подключиться: '+e.message;$('authError').hidden=false;}})();
+(async()=>{try{
+ const configResponse=await fetch('/api/config');if(!configResponse.ok)throw new Error('Не удалось загрузить настройки входа');
+ const config=await configResponse.json();registrationEnabled=config.registration_enabled===true;
+ $('registerTab').hidden=!registrationEnabled;
+ document.querySelector('.auth-local').textContent=config.hosted?'Закрытое пространство команды 7-Solutions. Доступ выдаёт администратор команды.':'Локальное пространство команды 7-Solutions. Аккаунт создаётся на этом компьютере. Email не проверяется письмом.';
+ const response=await fetch('/api/auth/me');if(response.status===401){showAuth();return;}const data=await response.json();if(!response.ok)throw new Error(data.error);await enterWorkspace(data.user,data.token);
+ }catch(e){showAuth();$('authError').textContent='Не удалось подключиться: '+e.message;$('authError').hidden=false;}})();

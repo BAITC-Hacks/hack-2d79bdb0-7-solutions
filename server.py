@@ -8,6 +8,7 @@ import io
 import json
 import math
 import mimetypes
+import os
 import secrets
 import threading
 import traceback
@@ -25,11 +26,26 @@ DATA.mkdir(exist_ok=True)
 LOCK=threading.RLock()
 TOKEN=secrets.token_urlsafe(24)
 STATE={}
+CLOUD=os.environ.get('APP_ENV')=='cloud'
+APP_ORIGIN=os.environ.get('APP_ORIGIN','').rstrip('/')
+if CLOUD and not APP_ORIGIN and os.environ.get('RENDER_EXTERNAL_HOSTNAME'):
+    APP_ORIGIN='https://'+os.environ['RENDER_EXTERNAL_HOSTNAME']
+
+
+def allowed_host(host):
+    if CLOUD:return bool(APP_ORIGIN) and host==urlparse(APP_ORIGIN).netloc
+    return host.split(':')[0] in ('127.0.0.1','localhost')
+
+
+def cookie_flags():
+    return '; Secure' if CLOUD else ''
 
 
 def read_dataset():
     saved=storage.get(DATA/'app.sqlite3','dataset','workspace')
     if saved is not None:return saved
+    # Cloud database is authoritative; never import a deploy's filesystem.
+    if CLOUD:return dict(items=[],meta=dict(notes=['Набор ещё не перенесён'],sources=[]))
     path=DATA/'dataset.json'
     ds=json.loads(path.read_text(encoding='utf-8')) if path.exists() else dict(items=[],meta=dict(notes=['Загрузите ZIP поставщика или откройте демо'],sources=[]))
     if path.exists():storage.put(DATA/'app.sqlite3','dataset','workspace',ds)
@@ -88,9 +104,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.headers.get('Host','').split(':')[0] not in ('127.0.0.1','localhost'):
+            if not allowed_host(self.headers.get('Host','')):
                 return self.send({'error':'Доступ разрешён только с локального компьютера'},403)
             path=urlparse(self.path).path
+            if path=='/healthz':
+                with storage.database(DATA/'app.sqlite3') as db:db.execute('SELECT 1')
+                return self.send({'ok':True})
+            if path=='/api/config':
+                return self.send(dict(registration_enabled=not CLOUD,hosted=CLOUD))
             user=self.current_user() if path.startswith('/api/') else None
             if path.startswith('/api/') and not user:
                 return self.send({'error':'Войдите в аккаунт'},401)
@@ -127,12 +148,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if self.headers.get('Host','').split(':')[0] not in ('127.0.0.1','localhost'):
+            if not allowed_host(self.headers.get('Host','')):
                 return self.send({'error':'Доступ разрешён только с локального компьютера'},403)
             path=urlparse(self.path).path
+            if CLOUD and path=='/api/auth/register':
+                return self.send({'error':'Регистрация закрыта. Обратитесь к администратору команды.'},403)
             # Same-origin JSON login/registration; cross-origin HTML forms are rejected.
             origin=self.headers.get('Origin')
-            if origin and origin not in ('http://'+self.headers.get('Host',''), 'https://'+self.headers.get('Host','')):
+            permitted_origins=(APP_ORIGIN,) if CLOUD else ('http://'+self.headers.get('Host',''), 'https://'+self.headers.get('Host',''))
+            if origin and origin not in permitted_origins:
                 return self.send({'error':'Недопустимый источник запроса'},403)
             public_auth=path in ('/api/auth/register','/api/auth/login')
             user=None if public_auth else self.current_user()
@@ -153,10 +177,10 @@ class Handler(BaseHTTPRequestHandler):
                     user=storage.register(DATA/'app.sqlite3',payload.get('email',''),payload.get('name',''),payload.get('password',''))
                 else:user=storage.login(DATA/'app.sqlite3',payload.get('email',''),payload.get('password',''))
                 session,csrf=storage.create_session(DATA/'app.sqlite3',user['id'])
-                return self.send(dict(user=user,token=csrf),headers={'Set-Cookie':f'seven_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200'})
+                return self.send(dict(user=user,token=csrf),headers={'Set-Cookie':f'seven_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200'+cookie_flags()})
             if path=='/api/auth/logout':
                 storage.logout(DATA/'app.sqlite3',self.session_token())
-                return self.send({'ok':True},headers={'Set-Cookie':'seven_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'})
+                return self.send({'ok':True},headers={'Set-Cookie':'seven_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'+cookie_flags()})
             path=urlparse(self.path).path
             if path=='/api/import':
                 filename=self.headers.get('X-Filename','')
@@ -231,6 +255,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__=='__main__':
+    if CLOUD:raise SystemExit('Hosted mode requires gunicorn wsgi:application, not the development server.')
     import argparse
     import zipfile
     p=argparse.ArgumentParser(); p.add_argument('--port',type=int,default=8765)
