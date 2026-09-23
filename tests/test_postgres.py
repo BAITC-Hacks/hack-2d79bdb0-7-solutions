@@ -16,12 +16,14 @@ class PostgresPersistence(unittest.TestCase):
         from psycopg import sql
         url=os.environ['TEST_DATABASE_URL']
         connect=storage.postgres_connect
+        rootcert=os.environ.get('PGSSLROOTCERT')
         schema='seven_test_'+uuid.uuid4().hex
         with connect(url) as db:db.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(schema)))
 
         @contextmanager
         def isolated(connection_url):
-            with connect(connection_url) as db:
+            tls={'PGSSLROOTCERT':rootcert} if rootcert else {}
+            with patch.dict(os.environ,tls),connect(connection_url) as db:
                 db.execute(sql.SQL('SET LOCAL search_path TO {}').format(sql.Identifier(schema)))
                 yield db
 
@@ -48,6 +50,9 @@ class PostgresPersistence(unittest.TestCase):
                         with self.assertRaises(ValueError):storage.register(None,'other@example.test','Other','SyntheticPass123!')
                         storage.put(None,'dataset','workspace',{'items':[{'code':'000_1'}]})
                         self.assertEqual(storage.get(None,'dataset','workspace')['items'][0]['code'],'000_1')
+                        large={'items':[{'code':'000_1','name':'Кабель'}]*3000}
+                        storage.put(None,'dataset','workspace',large)
+                        self.assertEqual(storage.get(None,'dataset','workspace'),large)
                         storage.logout(None,token)
                         self.assertIsNone(storage.session(None,token))
         finally:

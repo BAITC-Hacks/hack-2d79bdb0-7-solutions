@@ -13,7 +13,8 @@ Vercel Function не является постоянным сервером с �
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-cloud.txt
 $env:PGSCHEMA='seven_solutions'
-.\.venv\Scripts\python.exe cloud_admin.py --url-file data/supabase-url.secret migrate --source data/app.sqlite3
+$env:PGSSLROOTCERT=(Resolve-Path 'certs/supabase-ca.crt').Path
+.\.venv\Scripts\python.exe cloud_admin.py --url-file data/supabase-url.secret migrate --source data/app.sqlite3 --compress-documents
 ```
 
 Миграция создаёт локальную резервную копию и переносит только в пустую схему, сохраняет пароли и владельцев заказов, проверяет все поля в транзакции. Сессии/временные расчёты не переносятся. Старые заказы без владельца остаются закрытым архивом. Для нового пустого пространства вместо миграции выполнить `init`, затем `create-user`; пароль вводится скрыто. Публичная регистрация закрыта.
@@ -23,6 +24,7 @@ $env:PGSCHEMA='seven_solutions'
 - Framework Preset: Python, корень репозитория, конфигурация vercel.json и pyproject.toml.
 - `DATABASE_URL`: секрет PostgreSQL только для нужного окружения, не для браузера.
 - `PGSCHEMA=seven_solutions` (это также значение по умолчанию Vercel entrypoint).
+- `PGSSLROOTCERT=certs/supabase-ca.crt`: публичный CA из официальных настроек Supabase включён в исходники; приватных ключей в нём нет.
 - `APP_ORIGIN=https://точный-домен-проекта.vercel.app`. Если переменная отсутствует, используются VERCEL_PROJECT_PRODUCTION_URL, затем VERCEL_URL. Случайные Host/Origin отклоняются.
 - `APP_ENV=cloud` устанавливается самим entrypoint. Отсутствие базы/HTTPS-конфигурации даёт 503, без временного SQLite fallback.
 
@@ -38,10 +40,12 @@ Hobby предназначен для личных некоммерческих 
 
 ## Проверка
 
-`python -m unittest discover -s tests -v`: 57 тестов, 56 проходят, один PostgreSQL-тест пропускается без TEST_DATABASE_URL. Проверены сжатый импорт, расчёт/утверждение, повреждённые gzip, лимит распаковки, отсутствие записи в директорию приложения, приватная схема и прежние проверки входа/владения.
+`python -m unittest discover -s tests -v`: 58 тестов, 57 проходят, один PostgreSQL-тест пропускается без TEST_DATABASE_URL. PostgreSQL-тест отдельно прошёл в изолированной временной схеме настоящего Supabase. Проверены сжатый импорт, расчёт/утверждение, повреждённые gzip, лимит распаковки, отсутствие записи в директорию приложения, приватная схема и прежние проверки входа/владения.
+
+Большие документы в PostgreSQL сохраняются в lossless gzip/base64-кодировке с префиксом `gz1:`; старый обычный JSON по-прежнему читается. Локальная SQLite продолжает писать JSON. Это уменьшает передачу десятков мегабайт при каждом расчёте; схема документа и численные значения после декодирования прежние. Опция миграции `--compress-documents` применяет эту кодировку до переноса. Для точной сверки служебных float-дат PostgreSQL настроен на выдачу полной точности (`extra_float_digits=3`), без ослабления проверки совпадения.
 
 После размещения проверить `/healthz`, вход прежним аккаунтом, 3908 реальных товаров, синтетический расчёт → утверждение → CSV → история. Перезапустить deploy и проверить сохранность. В приватном окне `/api/status` должен давать 401, регистрация — 403. Для повторения PostgreSQL-теста использовать отдельную тестовую БД/схему по инструкции DEPLOYMENT.md.
 
-Статус: исходники подготовлены; создание проекта Vercel и Supabase выполнено, перенос и публичная проверка ещё не завершены. Наличие конфигурации не является подтверждением работающего сайта.
+Статус: первая сборка Vercel прошла; база перенесена и проверена (1 пользователь, общий набор и 1 старый заказ в закрытом архиве). Проверка актуального деплоя через публичный URL ещё выполняется.
 
 Источники: [Python WSGI](https://vercel.com/docs/functions/runtimes/python), [лимиты](https://vercel.com/docs/functions/limitations), [Hobby](https://vercel.com/docs/plans/hobby), [подключение Supabase](https://supabase.com/docs/guides/database/connecting-to-postgres).

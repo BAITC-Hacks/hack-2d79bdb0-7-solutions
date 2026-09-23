@@ -90,3 +90,10 @@ class VercelTransportTests(unittest.TestCase):
         for invalid in ('public; DROP TABLE users','a"b','a.b',''):
             with patch.dict(os.environ,{'PGSCHEMA':invalid}):
                 with self.assertRaises(ValueError):storage.postgres_schema()
+
+    def test_large_database_documents_round_trip_and_legacy_json(self):
+        data={'items':[{'code':'000_1','name':'Кабель','stock':None,'sales':[1.5,-2,0]}]*2000}
+        encoded=storage.encode_document(data,compress=True)
+        self.assertTrue(encoded.startswith('gz1:'))
+        self.assertEqual(storage.decode_document(encoded),data)
+        self.assertEqual(storage.decode_document(json.dumps(data)),data)
