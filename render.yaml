@@ -4,19 +4,15 @@ services:
     runtime: python
     plan: free
     region: frankfurt
-    branch: main
-    buildCommand: pip install -r requirements-cloud.txt && env -u APP_ENV -u DATABASE_URL -u TEST_DATABASE_URL -u APP_ORIGIN -u RENDER_EXTERNAL_HOSTNAME -u FIRST_USER_EMAIL -u FIRST_USER_PASSWORD python -m unittest discover -s tests -v
-    startCommand: python hosted_start.py
+    branch: madiyar/cloud-deploy
+    buildCommand: pip install -r requirements-cloud.txt && env -u APP_ENV -u DATABASE_URL -u APP_ORIGIN -u RENDER_EXTERNAL_HOSTNAME python -m unittest discover -s tests -v
+    startCommand: python cloud_admin.py init && gunicorn 'wsgi:create_app()' --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 180 --access-logfile -
     healthCheckPath: /healthz
-    autoDeployTrigger: "off"
+    autoDeployTrigger: commit
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.10
       - key: APP_ENV
         value: cloud
       - key: DATABASE_URL
-        sync: false
-      - key: FIRST_USER_EMAIL
-        sync: false
-      - key: FIRST_USER_PASSWORD
         sync: false

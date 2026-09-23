@@ -47,8 +47,6 @@ def initialize_postgres(url):
     # Explicit startup/migration step, never DDL per HTTP request.
     schema=SCHEMA.replace('id INTEGER PRIMARY KEY', 'id SERIAL PRIMARY KEY').replace('REAL', 'DOUBLE PRECISION')
     with postgres_connect(url) as db:
-        # PostgreSQL's IF NOT EXISTS alone does not serialize concurrent DDL.
-        db.execute('SELECT pg_advisory_xact_lock(73402109)')
         for statement in schema.split(';'):
             if statement.strip():db.execute(statement)
 
@@ -78,7 +76,7 @@ def password_hash(password,salt):
     return hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),600_000).hex()
 
 
-def new_user_fields(email,name,password):
+def register(path,email,name,password):
     email=str(email).strip().lower();name=str(name).strip()
     if len(email)>254 or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):
         raise ValueError('Введите корректный email')
@@ -88,11 +86,6 @@ def new_user_fields(email,name,password):
         raise ValueError('Пароль должен содержать от 8 до 256 символов')
     salt=secrets.token_hex(16)
     hashed=password_hash(password,salt)
-    return email,name,salt,hashed
-
-
-def register(path,email,name,password):
-    email,name,salt,hashed=new_user_fields(email,name,password)
     try:
         with database(path) as db:
             cursor=db.execute('INSERT INTO users(email,name,salt,password_hash,created) VALUES(?,?,?,?,?) RETURNING id',
