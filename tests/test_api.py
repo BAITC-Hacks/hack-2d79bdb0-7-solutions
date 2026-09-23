@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 from http.server import ThreadingHTTPServer
 import server
 from demo import dataset
+from test_importer import synthetic_zip
 
 
 class WorkflowTests(unittest.TestCase):
@@ -75,6 +76,19 @@ class WorkflowTests(unittest.TestCase):
     def test_invalid_options_are_rejected(self):
         status,_=self.post('/api/calculate',{'demo':True,'options':{'lead_days':-1}})
         self.assertEqual(status,400)
+
+    def test_zip_reconciliation_survives_supplier_refresh(self):
+        for supplier, quantity in [('IEK', 8), ('Systeme Electric', 15), ('IEK', 10)]:
+            request = Request(self.url+'/api/import', data=synthetic_zip(supplier, quantity),
+                              headers={'X-App-Token': server.TOKEN, 'X-Filename': 'synthetic.zip'})
+            with urlopen(request) as response:
+                self.assertEqual(response.status, 200)
+        with urlopen(self.url+'/api/status') as response:
+            reports = json.load(response)['meta']['reconciliation']
+        self.assertEqual(reports['IEK']['rows'][0]['delta'], -2)
+        self.assertEqual(reports['Systeme Electric']['rows'][0]['delta'], -7)
+        _, calculation = self.post('/api/calculate', {'options': {}})
+        self.assertIn('rows', calculation)
 
 
 if __name__=='__main__':unittest.main()
