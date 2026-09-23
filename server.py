@@ -8,13 +8,17 @@ import io
 import json
 import math
 import mimetypes
+import os
 import secrets
 import threading
 import traceback
 import zipfile
+import storage
+from http.cookies import SimpleCookie
 from engine import calculate, num
 from importer import import_zip, merge_datasets, validate_normalized
 from demo import dataset as demo_dataset
+from scenario import simulate
 
 ROOT=Path(__file__).resolve().parent
 DATA=ROOT/'data'
@@ -22,11 +26,30 @@ DATA.mkdir(exist_ok=True)
 LOCK=threading.RLock()
 TOKEN=secrets.token_urlsafe(24)
 STATE={}
+CLOUD=os.environ.get('APP_ENV')=='cloud'
+APP_ORIGIN=os.environ.get('APP_ORIGIN','').rstrip('/')
+if CLOUD and not APP_ORIGIN and os.environ.get('RENDER_EXTERNAL_HOSTNAME'):
+    APP_ORIGIN='https://'+os.environ['RENDER_EXTERNAL_HOSTNAME']
+
+
+def allowed_host(host):
+    if CLOUD:return bool(APP_ORIGIN) and host==urlparse(APP_ORIGIN).netloc
+    return host.split(':')[0] in ('127.0.0.1','localhost')
+
+
+def cookie_flags():
+    return '; Secure' if CLOUD else ''
 
 
 def read_dataset():
+    saved=storage.get(DATA/'app.sqlite3','dataset','workspace')
+    if saved is not None:return saved
+    # Cloud database is authoritative; never import a deploy's filesystem.
+    if CLOUD:return dict(items=[],meta=dict(notes=['Набор ещё не перенесён'],sources=[]))
     path=DATA/'dataset.json'
-    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else dict(items=[],meta=dict(notes=['Загрузите ZIP поставщика или откройте демо'],sources=[]))
+    ds=json.loads(path.read_text(encoding='utf-8')) if path.exists() else dict(items=[],meta=dict(notes=['Загрузите ZIP поставщика или откройте демо'],sources=[]))
+    if path.exists():storage.put(DATA/'app.sqlite3','dataset','workspace',ds)
+    return ds
 
 
 def atomic_json(path,data):
@@ -52,6 +75,18 @@ def validate_options(options):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def session_token(self):
+        cookie=SimpleCookie()
+        try:cookie.load(self.headers.get('Cookie',''))
+        except Exception:return ''
+        return cookie['seven_session'].value if 'seven_session' in cookie else ''
+
+    def current_user(self):
+        return storage.session(DATA/'app.sqlite3',self.session_token())
+
+    def calculation(self,calc_id,user_id):
+        return storage.get(DATA/'app.sqlite3','calculation',str(calc_id),user_id)
+
     def log_message(self, fmt, *args):
         print(fmt % args)
 
@@ -69,22 +104,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.headers.get('Host','').split(':')[0] not in ('127.0.0.1','localhost'):
+            if not allowed_host(self.headers.get('Host','')):
                 return self.send({'error':'Доступ разрешён только с локального компьютера'},403)
             path=urlparse(self.path).path
+            if path=='/healthz':
+                with storage.database(DATA/'app.sqlite3') as db:db.execute('SELECT 1')
+                return self.send({'ok':True})
+            if path=='/api/config':
+                return self.send(dict(registration_enabled=not CLOUD,hosted=CLOUD))
+            user=self.current_user() if path.startswith('/api/') else None
+            if path.startswith('/api/') and not user:
+                return self.send({'error':'Войдите в аккаунт'},401)
+            if path=='/api/auth/me':
+                return self.send(dict(user={k:user[k] for k in ('id','name','email')},token=user['csrf']))
+            if path=='/api/orders':
+                return self.send(dict(orders=storage.orders(DATA/'app.sqlite3',user['id'])))
             if path=='/api/status':
                 with LOCK:
                     ds=read_dataset()
-                return self.send(dict(token=TOKEN,items=len(ds['items']),meta=ds['meta']))
+                return self.send(dict(token=user['csrf'],user={k:user[k] for k in ('id','name','email')},items=len(ds['items']),meta=ds['meta']))
             if path=='/api/template':
                 example=demo_dataset()
                 return self.send(example,headers={'Content-Disposition':'attachment; filename="normalized-example.json"'})
             if path=='/api/export':
                 order_id=parse_qs(urlparse(self.path).query).get('id',[''])[0]
                 if not order_id.isalnum(): return self.send({'error':'Некорректный ID'},400)
-                file=DATA/('order-'+order_id+'.json')
-                if not file.exists(): return self.send({'error':'Заказ не найден'},404)
-                order=json.loads(file.read_text(encoding='utf-8'))
+                order=storage.get(DATA/'app.sqlite3','order',order_id,user['id'])
+                if not order:return self.send({'error':'Заказ не найден'},404)
                 out=io.StringIO(newline=''); writer=csv.writer(out,delimiter=';')
                 writer.writerow(['Набор','Поставщик','Код 1С','Артикул','Наименование','Количество','Ед.','Обоснование','Ответственный','Дата утверждения'])
                 def safe(v):
@@ -102,13 +148,39 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            if self.headers.get('Host','').split(':')[0] not in ('127.0.0.1','localhost'):
+            if not allowed_host(self.headers.get('Host','')):
                 return self.send({'error':'Доступ разрешён только с локального компьютера'},403)
-            if self.headers.get('X-App-Token')!=TOKEN:
-                return self.send({'error':'Обновите страницу приложения'},403)
+            path=urlparse(self.path).path
+            if CLOUD and path=='/api/auth/register':
+                return self.send({'error':'Регистрация закрыта. Обратитесь к администратору команды.'},403)
+            # Same-origin JSON login/registration; cross-origin HTML forms are rejected.
+            origin=self.headers.get('Origin')
+            permitted_origins=(APP_ORIGIN,) if CLOUD else ('http://'+self.headers.get('Host',''), 'https://'+self.headers.get('Host',''))
+            if origin and origin not in permitted_origins:
+                return self.send({'error':'Недопустимый источник запроса'},403)
+            public_auth=path in ('/api/auth/register','/api/auth/login')
+            user=None if public_auth else self.current_user()
+            if not public_auth:
+                if not user:return self.send({'error':'Войдите в аккаунт'},401)
+                if self.headers.get('X-App-Token')!=user['csrf']:
+                    return self.send({'error':'Обновите страницу приложения'},403)
+            elif not self.headers.get('Content-Type','').startswith('application/json'):
+                return self.send({'error':'Требуется JSON'},415)
             size=int(self.headers.get('Content-Length','0'))
             if not 0<size<=40_000_000: return self.send({'error':'Размер файла должен быть от 1 байта до 40 МБ'},400)
+            if public_auth and size>4096:return self.send({'error':'Слишком большой запрос'},400)
             body=self.rfile.read(size)
+            if public_auth:
+                payload=json.loads(body)
+                if not isinstance(payload,dict):raise ValueError('Ожидается JSON-объект')
+                if path.endswith('/register'):
+                    user=storage.register(DATA/'app.sqlite3',payload.get('email',''),payload.get('name',''),payload.get('password',''))
+                else:user=storage.login(DATA/'app.sqlite3',payload.get('email',''),payload.get('password',''))
+                session,csrf=storage.create_session(DATA/'app.sqlite3',user['id'])
+                return self.send(dict(user=user,token=csrf),headers={'Set-Cookie':f'seven_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200'+cookie_flags()})
+            if path=='/api/auth/logout':
+                storage.logout(DATA/'app.sqlite3',self.session_token())
+                return self.send({'ok':True},headers={'Set-Cookie':'seven_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'+cookie_flags()})
             path=urlparse(self.path).path
             if path=='/api/import':
                 filename=self.headers.get('X-Filename','')
@@ -123,10 +195,12 @@ class Handler(BaseHTTPRequestHandler):
                         # Sources are deduplicated by filename after supplier refresh.
                         merged=merge_datasets([existing,ds])
                         merged['meta']['sources']=list({s['file']:s for s in merged['meta']['sources']}.values())
-                    atomic_json(DATA/'dataset.json',merged)
+                    storage.put(DATA/'app.sqlite3','dataset','workspace',merged)
+                    storage.clear_calculations(DATA/'app.sqlite3')
                     STATE.clear()
                 return self.send(dict(items=len(merged['items']),meta=merged['meta']))
             payload=json.loads(body)
+            if not isinstance(payload,dict):raise ValueError('Ожидается JSON-объект')
             if path=='/api/calculate':
                 options=validate_options(payload.get('options',{}))
                 mode='demo' if payload.get('demo') else 'real'
@@ -137,12 +211,21 @@ class Handler(BaseHTTPRequestHandler):
                     result=calculate(ds,options)
                     calc_id=secrets.token_hex(12)
                     STATE[calc_id]=dict(result=result,mode=mode)
+                    storage.put(DATA/'app.sqlite3','calculation',calc_id,STATE[calc_id],user['id'])
                     while len(STATE)>15: STATE.pop(next(iter(STATE)))
                 result=dict(result,calculation_id=calc_id,mode=mode)
                 return self.send(result)
+            if path=='/api/scenario':
+                with LOCK:
+                    state=self.calculation(payload.get('calculation_id'),user['id'])
+                    if not state: return self.send({'error':'Расчёт устарел. Пересчитайте рекомендации'},409)
+                    row=next((r for r in state['result']['rows'] if r['id']==payload.get('id')),None)
+                    if row is None: raise ValueError('Неизвестный товар сценария')
+                    scenario=simulate(row,state['result']['options'],payload.get('shock',{}))
+                return self.send(scenario)
             if path=='/api/approve':
                 with LOCK:
-                    state=STATE.get(payload.get('calculation_id'))
+                    state=self.calculation(payload.get('calculation_id'),user['id'])
                     if not state: return self.send({'error':'Расчёт устарел. Пересчитайте рекомендации'},409)
                     responsible=str(payload.get('responsible','')).strip()
                     if not responsible: raise ValueError('Укажите ответственного сотрудника')
@@ -162,7 +245,7 @@ class Handler(BaseHTTPRequestHandler):
                     order_id=secrets.token_hex(8)
                     order=dict(id=order_id,created=datetime.now().isoformat(timespec='seconds'),
                         responsible=responsible,mode=state['mode'],options=state['result']['options'],rows=approved)
-                    atomic_json(DATA/('order-'+order_id+'.json'),order)
+                    storage.put(DATA/'app.sqlite3','order',order_id,order,user['id'])
                 return self.send(dict(id=order_id,lines=len(approved),url='/api/export?id='+order_id))
             self.send({'error':'Не найдено'},404)
         except (ValueError,KeyError,TypeError,OverflowError,zipfile.BadZipFile) as e:
@@ -172,6 +255,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__=='__main__':
+    if CLOUD:raise SystemExit('Hosted mode requires gunicorn wsgi:application, not the development server.')
     import argparse
     import zipfile
     p=argparse.ArgumentParser(); p.add_argument('--port',type=int,default=8765)

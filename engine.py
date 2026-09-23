@@ -181,7 +181,8 @@ def calculate_item(item, options):
         lost=round(lost,2), growth_factor=round(growth,3), category_multiplier=category_multiplier,
         seasonality=[round(v,3) for v in factors], anomalies=anomalies[:30],
         history=[dict(month=k, raw=history[k], clean=round(cleaned[k],2), imputed=round(imputed.get(k,0),2)) for k in sorted(history)[-24:]],
-        arrivals=item.get('inbound', []))
+        arrivals=item.get('inbound', []),
+        daily_demand=[daily * factors[(asof+timedelta(days=d)).month-1] * growth for d in range(horizon)])
     return result
 
 

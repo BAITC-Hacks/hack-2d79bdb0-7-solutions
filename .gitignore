@@ -5,3 +5,7 @@ data/*
 !data/.gitkeep
 *.zip
 .env
+.env.*
+*.sqlite3*
+*.db
+*.secret

@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 from http.server import ThreadingHTTPServer
 import server
+import storage
 from demo import dataset
 from test_importer import synthetic_zip
 
@@ -23,6 +24,9 @@ class WorkflowTests(unittest.TestCase):
         cls.url=f'http://127.0.0.1:{cls.http.server_port}'
         cls.thread=threading.Thread(target=cls.http.serve_forever,daemon=True)
         cls.thread.start()
+        user=storage.register(server.DATA/'app.sqlite3','qa@example.test','QA Team','SyntheticPass123!')
+        session,cls.csrf=storage.create_session(server.DATA/'app.sqlite3',user['id'])
+        cls.cookie='seven_session='+session
 
     @classmethod
     def tearDownClass(cls):
@@ -30,8 +34,8 @@ class WorkflowTests(unittest.TestCase):
         server.DATA=cls.old;cls.tmp.cleanup()
 
     def post(self,path,payload,token=True,headers=None):
-        h={'Content-Type':'application/json',**(headers or {})}
-        if token:h['X-App-Token']=server.TOKEN
+        h={'Content-Type':'application/json','Cookie':self.cookie,**(headers or {})}
+        if token:h['X-App-Token']=self.csrf
         request=Request(self.url+path,data=json.dumps(payload).encode(),headers=h)
         try:
             with urlopen(request) as r:return r.status,json.load(r)
@@ -43,7 +47,7 @@ class WorkflowTests(unittest.TestCase):
         row=next(r for r in cal['rows'] if r['quantity']>0)
         status,order=self.post('/api/approve',dict(calculation_id=cal['calculation_id'],responsible='QA',lines={row['id']:row['quantity']}))
         self.assertEqual(status,200)
-        with urlopen(self.url+order['url']) as response:
+        with urlopen(Request(self.url+order['url'],headers={'Cookie':self.cookie})) as response:
             lines=list(csv.reader(io.StringIO(response.read().decode('utf-8-sig')),delimiter=';'))
         self.assertEqual(len(lines),2)
         self.assertEqual(lines[1][0],'demo')
@@ -55,9 +59,25 @@ class WorkflowTests(unittest.TestCase):
         status,_=self.post('/api/approve',dict(calculation_id=cal['calculation_id'],responsible='QA',lines={'demo:0':11}))
         self.assertEqual(status,400)
 
+    def test_scenario_is_isolated_and_requires_valid_calculation(self):
+        _,cal=self.post('/api/calculate',{'demo':True,'options':{}})
+        row=next(r for r in cal['rows'] if r['id']=='demo:0')
+        payload=dict(calculation_id=cal['calculation_id'],id=row['id'],shock={'delay_days':20,'demand_pct':60})
+        status,scenario=self.post('/api/scenario',payload)
+        self.assertEqual(status,200)
+        self.assertEqual(scenario['protected']['unmet'],0)
+        saved=next(r for r in server.STATE[cal['calculation_id']]['result']['rows'] if r['id']==row['id'])
+        self.assertEqual(saved,row)
+        status,_=self.post('/api/scenario',dict(payload,calculation_id='expired'))
+        self.assertEqual(status,409)
+        status,_=self.post('/api/scenario',dict(payload,shock={'delay_days':-1}))
+        self.assertEqual(status,400)
+        status,_=self.post('/api/scenario',payload,token=False)
+        self.assertEqual(status,403)
+
     def test_missing_stock_cannot_be_approved(self):
         ds=dataset();ds['items'][0].update(stock=None,stock_kind='missing')
-        server.atomic_json(server.DATA/'dataset.json',ds)
+        storage.put(server.DATA/'app.sqlite3','dataset','workspace',ds)
         _,cal=self.post('/api/calculate',{'options':{}})
         status,_=self.post('/api/approve',dict(calculation_id=cal['calculation_id'],responsible='QA',lines={'demo:0':10}))
         self.assertEqual(status,400)
@@ -77,13 +97,14 @@ class WorkflowTests(unittest.TestCase):
         status,_=self.post('/api/calculate',{'demo':True,'options':{'lead_days':-1}})
         self.assertEqual(status,400)
 
+
     def test_zip_reconciliation_survives_supplier_refresh(self):
         for supplier, quantity in [('IEK', 8), ('Systeme Electric', 15), ('IEK', 10)]:
             request = Request(self.url+'/api/import', data=synthetic_zip(supplier, quantity),
-                              headers={'X-App-Token': server.TOKEN, 'X-Filename': 'synthetic.zip'})
+                              headers={'X-App-Token': self.csrf, 'Cookie': self.cookie, 'X-Filename': 'synthetic.zip'})
             with urlopen(request) as response:
                 self.assertEqual(response.status, 200)
-        with urlopen(self.url+'/api/status') as response:
+        with urlopen(Request(self.url+'/api/status',headers={'Cookie':self.cookie})) as response:
             reports = json.load(response)['meta']['reconciliation']
         self.assertEqual(reports['IEK']['rows'][0]['delta'], -2)
         self.assertEqual(reports['Systeme Electric']['rows'][0]['delta'], -7)
