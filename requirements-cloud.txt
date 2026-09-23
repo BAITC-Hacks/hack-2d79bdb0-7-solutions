@@ -1,4 +1,3 @@
 -r requirements.txt
+# WSGI server for Linux hosting; Vercel supplies its own runtime.
 gunicorn>=23,<24
-psycopg[binary]>=3.2,<4
-certifi>=2025.1.31
